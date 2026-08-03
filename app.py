@@ -3,10 +3,11 @@ import pandas as pd
 import requests
 import json
 import re
+import os
 import plotly.graph_objects as go
 
 # ==========================================
-# 1. STREAMLIT CONFIG & INITIALISIERUNG
+# 1. STREAMLIT CONFIG & LOKALE SPEICHERUNG
 # ==========================================
 st.set_page_config(
     page_title="Caloop - Fitness & Nutrition Tracker",
@@ -14,32 +15,52 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- GEMINI CLIENT SETUP ---
-gemini_client = None
-if "GEMINI_API_KEY" in st.secrets:
-    try:
-        from google import genai
-        gemini_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-    except Exception as e:
-        pass
+DATA_FILE = "user_data.json"
 
-# --- SESSION STATE INITIALISIERUNG ---
-if "current_page" not in st.session_state:
-    st.session_state["current_page"] = "Übersicht"
-
-if "user_goals" not in st.session_state:
-    st.session_state["user_goals"] = {
+# Standarddaten für ein einzelnes Gerät/Nutzer
+DEFAULT_DATA = {
+    "profile": {
         "name": "Benutzer",
         "alter": 30,
         "geschlecht": "Weiblich",
         "groesse": 170,
         "gewicht": 70.0,
+        "aktivitaet": "Leichte Aktivität (z. B. Büro + Gehen)",
         "ziel": "Gewicht halten",
-        "phase": "Keine",  # Keine, Schwanger, Stillend
+        "phase": "Keine",
         "erkrankungen": "",
         "final_kcal": 2000,
         "final_wasser": 2500
     }
+}
+
+def load_user_data():
+    """Lädt die lokalen Nutzerdaten vom Gerät."""
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return DEFAULT_DATA
+    return DEFAULT_DATA
+
+def save_user_data():
+    """Speichert die Nutzerdaten lokal auf dem Gerät."""
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "profile": st.session_state["profile"]
+            }, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        st.error(f"Fehler beim Speichern: {e}")
+
+# Persistenten Zustand initialisieren
+if "profile" not in st.session_state:
+    loaded = load_user_data()
+    st.session_state["profile"] = loaded.get("profile", DEFAULT_DATA["profile"])
+
+if "current_page" not in st.session_state:
+    st.session_state["current_page"] = "Übersicht"
 
 if "today_log" not in st.session_state:
     st.session_state["today_log"] = {
@@ -51,23 +72,28 @@ if "today_log" not in st.session_state:
 if "favorites_all" not in st.session_state:
     st.session_state["favorites_all"] = []
 
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
+# --- GEMINI CLIENT SETUP ---
+gemini_client = None
+if "GEMINI_API_KEY" in st.secrets:
+    try:
+        from google import genai
+        gemini_client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    except Exception:
+        pass
 
 def go_to_page(page_name):
     st.session_state["current_page"] = page_name
 
-user_goals = st.session_state["user_goals"]
+profile = st.session_state["profile"]
 today_log = st.session_state["today_log"]
-user = user_goals["name"]
+user_name = profile.get("name", "Benutzer")
 
 # ==========================================
 # 2. KI & DATENBANK-LOGIK (AUTOMATISCH)
 # ==========================================
 
 def analyze_food_auto(prompt_text):
-    """Versucht zuerst die KI-Analyse, nutzt OpenFoodFacts als Backup."""
-    # 1. Versuch mit Gemini KI
+    """Versucht KI-Analyse, nutzt OpenFoodFacts als Backup."""
     if gemini_client:
         try:
             sys_prompt = """
@@ -95,7 +121,6 @@ def analyze_food_auto(prompt_text):
         except Exception:
             pass
 
-    # 2. Fallback auf OpenFoodFacts
     clean_query = re.sub(r'\b\d+([.,]\d+)?\s*(g|gr|gramm|ml|l|kg|%)\b', '', prompt_text, flags=re.IGNORECASE)
     clean_query = re.sub(r'\b\d+([.,]\d+)?\b', '', clean_query).strip()
     search_term = clean_query if clean_query else prompt_text
@@ -109,7 +134,6 @@ def analyze_food_auto(prompt_text):
             prod = res["products"][0]
             nut = prod.get("nutriments", {})
             
-            # Versuche Menge aus Text zu extrahieren, sonst 100g
             gramm_match = re.search(r'(\d+)\s*(g|gr|gramm|ml)', prompt_text, re.IGNORECASE)
             factor = (float(gramm_match.group(1)) / 100.0) if gramm_match else 1.0
 
@@ -128,18 +152,15 @@ def analyze_food_auto(prompt_text):
     return None
 
 # ==========================================
-# 3. RINGDIAGRAMM MIT WASSERSTAND (PLOTLY)
+# 3. RINGDIAGRAMM MIT WASSERSTAND
 # ==========================================
 
 def create_ring_water_chart(consumed_kcal, target_kcal, water_ml, target_water):
-    # Prozentwerte berechnen
-    kcal_pct = min(100, (consumed_kcal / max(1, target_kcal)) * 100)
     water_pct = min(100, (water_ml / max(1, target_water)) * 100)
     remaining_kcal = max(0, target_kcal - consumed_kcal)
 
     fig = go.Figure()
 
-    # Outer Ring: Kalorien (Donut Chart)
     fig.add_trace(go.Pie(
         labels=["Aufgenommen", "Verbleibend"],
         values=[consumed_kcal, remaining_kcal],
@@ -150,8 +171,6 @@ def create_ring_water_chart(consumed_kcal, target_kcal, water_ml, target_water):
         showlegend=False
     ))
 
-    # Inner Fill: Wasserstand als blaue Form im Loch
-    # Berechne Höhe des Wasserschnitts (-0.68 bis +0.68)
     water_height = -0.68 + (1.36 * (water_pct / 100.0))
     
     fig.add_shape(
@@ -164,7 +183,6 @@ def create_ring_water_chart(consumed_kcal, target_kcal, water_ml, target_water):
         layer="below"
     )
 
-    # Text in der Mitte
     fig.add_annotation(
         text=f"<b>{consumed_kcal} / {target_kcal}</b><br>kcal<br><br><span style='color:#2980B9;'>💧 {water_ml} ml</span>",
         x=0.5, y=0.5,
@@ -182,15 +200,17 @@ def create_ring_water_chart(consumed_kcal, target_kcal, water_ml, target_water):
     return fig
 
 # ==========================================
-# 4. SIDEBAR NAVIGATION
+# 4. SIDEBAR NAVIGATION (NUR HAUPTSEITEN)
 # ==========================================
 with st.sidebar:
     st.title("🥑 Caloop")
-    st.caption(f"Angemeldet als **{user}**")
+    st.caption(f"Angemeldet als: **{user_name}**")
     st.write("---")
     
-    pages = ["Übersicht", "Essen", "Trinken", "Bewegung", "Favoriten", "Feedback", "Profil"]
-    for p in pages:
+    # Essen, Trinken und Bewegung wurden aus der Sidebar entfernt
+    sidebar_pages = ["Übersicht", "Favoriten", "Feedback", "Profil"]
+    
+    for p in sidebar_pages:
         btn_type = "primary" if st.session_state["current_page"] == p else "secondary"
         if st.button(p, key=f"nav_{p}", type=btn_type, use_container_width=True):
             go_to_page(p)
@@ -206,8 +226,26 @@ selected_page = st.session_state["current_page"]
 # REITER: ÜBERSICHT
 # ------------------------------------------
 if selected_page == "Übersicht":
-    st.title(f"👋 Hallo, {user}!")
+    st.title(f"👋 Hallo, {user_name}!")
     
+    # Aktions-Buttons oben auf der Übersicht zur Navigation
+    st.subheader("⚡ Schnell-Erfassung")
+    act_col1, act_col2, act_col3 = st.columns(3)
+    
+    if act_col1.button("🍽️ Essen eintragen", use_container_width=True, type="primary"):
+        go_to_page("Essen")
+        st.rerun()
+        
+    if act_col2.button("🥤 Trinken eintragen", use_container_width=True, type="primary"):
+        go_to_page("Trinken")
+        st.rerun()
+        
+    if act_col3.button("🏃 Bewegung eintragen", use_container_width=True, type="primary"):
+        go_to_page("Bewegung")
+        st.rerun()
+
+    st.write("---")
+
     tot_kcal = sum(i.get("kcal", 0) for i in today_log["eaten"])
     tot_prot = sum(i.get("protein", 0.0) for i in today_log["eaten"])
     burned = today_log["bewegung_kcal"]
@@ -217,27 +255,30 @@ if selected_page == "Übersicht":
 
     with col_chart:
         st.subheader("🎯 Kalorien & Wasser im Ring")
-        chart = create_ring_water_chart(tot_kcal, user_goals["final_kcal"], today_log["wasser_ml"], user_goals["final_wasser"])
+        chart = create_ring_water_chart(tot_kcal, profile["final_kcal"], today_log["wasser_ml"], profile["final_wasser"])
         st.plotly_chart(chart, use_container_width=True)
 
     with col_stats:
         st.subheader("📊 Tageswerte")
         st.metric("Gegessen", f"{tot_kcal} kcal")
         st.metric("Verbrannt (Sport)", f"{burned} kcal")
-        st.metric("Netto-Kalorien", f"{net_kcal} / {user_goals['final_kcal']} kcal")
+        st.metric("Netto-Kalorien", f"{net_kcal} / {profile['final_kcal']} kcal")
         st.metric("Protein", f"{tot_prot:.1f} g")
 
 # ------------------------------------------
-# REITER: ESSEN (AUTOMATISCH & EINFACH)
+# REITER: ESSEN (Nur via Button erreichbar)
 # ------------------------------------------
 elif selected_page == "Essen":
+    if st.button("⬅️ Zurück zur Übersicht"):
+        go_to_page("Übersicht")
+        st.rerun()
+
     st.title("🍽️ Essen erfassen")
     
     target_dest = st.radio("Speichern in:", ["Tagestracker", "Favoriten"], horizontal=True)
     kat = st.selectbox("Mahlzeit", ["Frühstück", "Mittagessen", "Abendessen", "Snack"])
 
     st.write("---")
-    
     food_input = st.text_input("Was hast du gegessen?", placeholder="z. B. 200 g Joghurt 1,8% Fett oder 2 Scheiben Vollkornbrot mit Käse")
 
     if st.button("🚀 Automatisch erfassen", type="primary", use_container_width=True):
@@ -265,11 +306,15 @@ elif selected_page == "Essen":
                 st.error("Konnte nicht verarbeitet werden. Bitte versuche es genauer zu beschreiben.")
 
 # ------------------------------------------
-# REITER: TRINKEN
+# REITER: TRINKEN (Nur via Button erreichbar)
 # ------------------------------------------
 elif selected_page == "Trinken":
+    if st.button("⬅️ Zurück zur Übersicht"):
+        go_to_page("Übersicht")
+        st.rerun()
+
     st.title("🥤 Wasser-Tracker")
-    st.metric("Bereits getrunken", f"{today_log['wasser_ml']} ml", f"Ziel: {user_goals['final_wasser']} ml")
+    st.metric("Bereits getrunken", f"{today_log['wasser_ml']} ml", f"Ziel: {profile['final_wasser']} ml")
     
     c1, c2, c3 = st.columns(3)
     if c1.button("➕ 250 ml", use_container_width=True):
@@ -283,17 +328,21 @@ elif selected_page == "Trinken":
         st.rerun()
 
 # ------------------------------------------
-# REITER: BEWEGUNG
+# REITER: BEWEGUNG (Nur via Button erreichbar)
 # ------------------------------------------
 elif selected_page == "Bewegung":
+    if st.button("⬅️ Zurück zur Übersicht"):
+        go_to_page("Übersicht")
+        st.rerun()
+
     st.title("🏃 Bewegung")
     act = st.selectbox("Aktivität", ["Gehen", "Joggen", "Radfahren", "Krafttraining", "Schwimmen"])
     duration = st.number_input("Dauer (Minuten)", min_value=5, value=30, step=5)
     
     mets = {"Gehen": 3.5, "Joggen": 8.0, "Radfahren": 6.0, "Krafttraining": 5.0, "Schwimmen": 7.0}
-    burned = int((mets[act] * 3.5 * user_goals["gewicht"] / 200) * duration)
+    burned = int((mets[act] * 3.5 * profile["gewicht"] / 200) * duration)
     
-    if st.button(f"Eintragen (~{burned} kcal)"):
+    if st.button(f"Eintragen (~{burned} kcal)", type="primary"):
         today_log["bewegung_kcal"] += burned
         st.success("Aktivität verbucht!")
 
@@ -317,51 +366,74 @@ elif selected_page == "Favoriten":
 # ------------------------------------------
 elif selected_page == "Feedback":
     st.title("📊 Feedback & Nährstoffe")
-    
     if today_log["eaten"]:
         st.dataframe(pd.DataFrame(today_log["eaten"])[["name", "kcal", "protein", "carbs", "fat"]], use_container_width=True)
     else:
         st.info("Noch keine Speisen heute getrackt.")
 
 # ------------------------------------------
-# REITER: PROFIL (UMFASSENDE PERSÖNLICHE DATEN)
+# REITER: PROFIL (LOKAL GE SPEICHERT)
 # ------------------------------------------
 elif selected_page == "Profil":
-    st.title("⚙️ Profil & Gesundheitseinstellungen")
+    st.title("⚙️ Profil bearbeiten")
     
+    akt_options = [
+        "Sitzend (z. B. Büro, kaum Bewegung)",
+        "Leichte Aktivität (z. B. Büro + Gehen)",
+        "Mäßige Aktivität (z. B. Handwerk / viel Stehen)",
+        "Hohe Aktivität (z. B. schwere körperliche Arbeit)"
+    ]
+
     with st.form("profile_form"):
         st.subheader("Persönliche Stammdaten")
         c1, c2 = st.columns(2)
         with c1:
-            name = st.text_input("Name", value=user_goals["name"])
-            alter = st.number_input("Alter", min_value=10, max_value=120, value=user_goals["alter"])
-            geschlecht = st.selectbox("Geschlecht", ["Weiblich", "Männlich", "Divers"], index=["Weiblich", "Männlich", "Divers"].index(user_goals["geschlecht"]))
+            name = st.text_input("Name", value=profile.get("name", "Benutzer"))
+            alter = st.number_input("Alter", min_value=10, max_value=120, value=profile.get("alter", 30))
+            geschlecht = st.selectbox("Geschlecht", ["Weiblich", "Männlich", "Divers"], index=["Weiblich", "Männlich", "Divers"].index(profile.get("geschlecht", "Weiblich")))
         with c2:
-            groesse = st.number_input("Größe (cm)", min_value=100, max_value=230, value=user_goals["groesse"])
-            gewicht = st.number_input("Gewicht (kg)", min_value=30.0, max_value=250.0, value=float(user_goals["gewicht"]), step=0.5)
-            ziel = st.selectbox("Ziel", ["Gewicht halten", "Abnehmen", "Zunehmen"], index=["Gewicht halten", "Abnehmen", "Zunehmen"].index(user_goals["ziel"]))
+            groesse = st.number_input("Größe (cm)", min_value=100, max_value=230, value=profile.get("groesse", 170))
+            gewicht = st.number_input("Gewicht (kg)", min_value=30.0, max_value=250.0, value=float(profile.get("gewicht", 70.0)), step=0.5)
+            ziel = st.selectbox("Ziel", ["Gewicht halten", "Abnehmen", "Zunehmen"], index=["Gewicht halten", "Abnehmen", "Zunehmen"].index(profile.get("ziel", "Gewicht halten")))
+
+        st.write("---")
+        st.subheader("🏃 Alltag & Aktivitätslevel (PAL)")
+        curr_akt = profile.get("aktivitaet", akt_options[1])
+        akt_idx = akt_options.index(curr_akt) if curr_akt in akt_options else 1
+        aktivitaet = st.selectbox("Alltagsaktivität", akt_options, index=akt_idx)
 
         st.write("---")
         st.subheader("Frauengesundheit & Besondere Phasen")
-        phase = st.selectbox("Aktuelle Lebensphase", ["Keine", "Schwangerschaft (1. Trimester)", "Schwangerschaft (2./3. Trimester)", "Stillzeit"], index=0)
+        phase_list = ["Keine", "Schwangerschaft (1. Trimester)", "Schwangerschaft (2./3. Trimester)", "Stillzeit"]
+        curr_phase = profile.get("phase", "Keine")
+        phase_idx = phase_list.index(curr_phase) if curr_phase in phase_list else 0
+        phase = st.selectbox("Aktuelle Lebensphase", phase_list, index=phase_idx)
 
         st.write("---")
         st.subheader("Gesundheit & Erkrankungen")
-        erkrankungen = st.text_area("Vorerkrankungen / Hinweise (z. B. Diabetes, Schilddrüsenunterfunktion, Unverträglichkeiten)", value=user_goals["erkrankungen"], placeholder="Hier eintragen...")
+        erkrankungen = st.text_area("Vorerkrankungen / Hinweise (z. B. Diabetes, Schilddrüsenunterfunktion)", value=profile.get("erkrankungen", ""), placeholder="Hier eintragen...")
 
-        submit = st.form_submit_button("Speichern & Ziele berechnen", type="primary")
+        submit = st.form_submit_button("💾 Dauerhaft Speichern & Ziel berechnen", type="primary")
 
         if submit:
-            # BMR Berechnung (Harris-Benedict)
+            # 1. Grundumsatz (BMR)
             if geschlecht == "Männlich":
                 bmr = 88.362 + (13.397 * gewicht) + (4.799 * groesse) - (5.677 * alter)
             else:
                 bmr = 447.593 + (9.247 * gewicht) + (3.098 * groesse) - (4.330 * alter)
 
-            calc_kcal = bmr * 1.35  # Leichte Aktivität
-            calc_wasser = gewicht * 35.0  # 35ml pro kg
+            # 2. PAL-Faktoren für Alltagsaktivität
+            pal_map = {
+                "Sitzend (z. B. Büro, kaum Bewegung)": 1.2,
+                "Leichte Aktivität (z. B. Büro + Gehen)": 1.4,
+                "Mäßige Aktivität (z. B. Handwerk / viel Stehen)": 1.6,
+                "Hohe Aktivität (z. B. schwere körperliche Arbeit)": 1.9
+            }
+            pal = pal_map.get(aktivitaet, 1.4)
+            calc_kcal = bmr * pal
+            calc_wasser = gewicht * 35.0
 
-            # Aufschläge Schwangerschaft / Stillzeit
+            # 3. Phasen-Aufschläge
             if "2./3. Trimester" in phase:
                 calc_kcal += 300
                 calc_wasser += 300
@@ -369,17 +441,21 @@ elif selected_page == "Profil":
                 calc_kcal += 500
                 calc_wasser += 600
 
-            # Anpassung Ziel
+            # 4. Ziel-Anpassung
             if ziel == "Abnehmen":
                 calc_kcal -= 400
             elif ziel == "Zunehmen":
                 calc_kcal += 300
 
-            user_goals.update({
+            # Werte im Profil speichern
+            profile.update({
                 "name": name, "alter": alter, "geschlecht": geschlecht,
                 "groesse": groesse, "gewicht": gewicht, "ziel": ziel,
-                "phase": phase, "erkrankungen": erkrankungen,
+                "aktivitaet": aktivitaet, "phase": phase, "erkrankungen": erkrankungen,
                 "final_kcal": int(calc_kcal),
                 "final_wasser": int(calc_wasser)
             })
-            st.success("Profil erfolgreich gespeichert und Tagesbedarf neu berechnet!")
+
+            save_user_data()  # Speichert dauerhaft auf dem Gerät in user_data.json
+            st.success("✅ Profildaten erfolgreich gespeichert!")
+            st.rerun()
