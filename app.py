@@ -274,6 +274,9 @@ selected_page = st.session_state["selected_page"]
 # ==========================================
 # REITER: ÜBERSICHT (DAS DASHBOARD)
 # ==========================================
+# ==========================================
+# REITER: ÜBERSICHT (DAS DASHBOARD)
+# ==========================================
 if selected_page == "Übersicht":
     st.markdown(f"<p style='text-align: center; color: gray;'>{date.today().strftime('%A, %d. %B %Y')}</p>", unsafe_allow_html=True)
 
@@ -300,7 +303,7 @@ if selected_page == "Übersicht":
         sort=False
     ))
 
-    # Der innere Wasser-Kreis passt sich exakt an die Donut-Lochgröße (hole=0.68) an
+    # Der innere Wasser-Kreis passt sich exakt an die Donut-Lochgröße an
     fig.update_layout(
         showlegend=False,
         margin=dict(t=10, b=10, l=10, r=10),
@@ -315,7 +318,7 @@ if selected_page == "Übersicht":
             dict(
                 type="circle",
                 xref="paper", yref="paper",
-                x0=0.16, y0=0.16, x1=0.84, y1=0.84, # Präzise an Lochgröße 0.68 angepasst
+                x0=0.16, y0=0.16, x1=0.84, y1=0.84,
                 fillcolor=f"rgba(30, 136, 229, {round(water_ratio * 0.75, 2)})",
                 line=dict(color="#1E88E5", width=1),
                 layer="below"
@@ -325,33 +328,28 @@ if selected_page == "Übersicht":
     
     st.plotly_chart(fig, use_container_width=True)
 
-    # RUNDE ICON-BUTTONS NEBENEINANDER (Essen, Trinken, Bewegung)
+    # Callback-Funktionen für fehlerfreie Navigation
+    def go_to_page(page_name):
+        st.session_state["selected_page"] = page_name
+
+    # RUNDE ICON-BUTTONS NEBENEINANDER (Ohne Text)
     c_btn1, c_btn2, c_btn3 = st.columns(3)
     
     with c_btn1:
         st.markdown('<div class="round-icon-btn">', unsafe_allow_html=True)
-        if st.button("🍽️", key="nav_essen"):
-            st.session_state["selected_page"] = "Essen"
-            st.rerun()
+        st.button("🍽️", key="nav_essen", on_click=go_to_page, args=("Essen",))
         st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown("<p style='text-align: center; font-weight: bold;'>Essen</p>", unsafe_allow_html=True)
 
     with c_btn2:
         st.markdown('<div class="round-icon-btn">', unsafe_allow_html=True)
-        if st.button("💧", key="nav_trinken"):
-            st.session_state["selected_page"] = "Trinken"
-            st.rerun()
+        st.button("💧", key="nav_trinken", on_click=go_to_page, args=("Trinken",))
         st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown("<p style='text-align: center; font-weight: bold;'>Trinken</p>", unsafe_allow_html=True)
 
     with c_btn3:
         st.markdown('<div class="round-icon-btn">', unsafe_allow_html=True)
-        if st.button("🏃", key="nav_bewegung"):
-            st.session_state["selected_page"] = "Bewegung"
-            st.rerun()
+        st.button("🏃", key="nav_bewegung", on_click=go_to_page, args=("Bewegung",))
         st.markdown('</div>', unsafe_allow_html=True)
-        st.markdown("<p style='text-align: center; font-weight: bold;'>Bewegung</p>", unsafe_allow_html=True)
-
+        
 # ==========================================
 # REITER: ESSEN
 # ==========================================
