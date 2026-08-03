@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 import os
 import re
 import requests
+import json
+from google import genai
 
 # ==========================================
 # 1. SEITENKONFIGURATION & LOGO-CHECK
@@ -22,11 +24,6 @@ st.set_page_config(
 # ==========================================
 # 2. DESIGN & STYLING (HEX-Farben aus Skizze/Logo)
 # ==========================================
-# Extrahierte Farbtöne:
-# Dark Teal / Navy-Grün (Schrift & Inputs): #0E5E6F / #083D48
-# Primary Buttons (Verlauf/Grün-Blau): #108997, #13A99A, #2EC4B6
-# Accent Blue (Wasser): #1E88E5 / #00B0FF
-
 st.markdown(f"""
 <style>
     /* Hintergrund Hauptseite */
@@ -60,7 +57,7 @@ st.markdown(f"""
         color: #B0BEC5 !important;
     }}
 
-    /* BUTTONS: Runder Stil in Blau- & Grüntönen */
+    /* STANDARDBUTTONS */
     .stButton > button {{
         background: linear-gradient(135deg, #108997 0%, #2EC4B6 100%);
         color: white !important;
@@ -79,10 +76,19 @@ st.markdown(f"""
         box-shadow: 0 6px 12px rgba(14, 94, 111, 0.3);
     }}
 
-    /* Spezielle Styles für Navigations-Buttons */
-    .nav-btn-essen > button {{ background: linear-gradient(135deg, #13A99A, #2EC4B6); }}
-    .nav-btn-trinken > button {{ background: linear-gradient(135deg, #00B0FF, #1E88E5); }}
-    .nav-btn-bewegung > button {{ background: linear-gradient(135deg, #0E5E6F, #108997); }}
+    /* RUNDE ICON-BUTTONS AUF DER ÜBERSICHT */
+    .round-icon-btn > button {{
+        border-radius: 50% !important;
+        width: 70px !important;
+        height: 70px !important;
+        padding: 0 !important;
+        font-size: 28px !important;
+        line-height: 70px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin: auto !important;
+    }}
 
     /* Cards / Container */
     .card-box {{
@@ -94,6 +100,12 @@ st.markdown(f"""
     }}
 </style>
 """, unsafe_allow_html=True)
+
+# LOGO OBEN MITTIG AUF JEDER SEITE (ca. 20% kleiner = width 100)
+if HAS_LOGO:
+    col_l1, col_l2, col_l3 = st.columns([1, 1, 1])
+    with col_l2:
+        st.image(LOGO_PATH, width=100)
 
 # ==========================================
 # 3. INITIALISIERUNG DES SESSION STATES
@@ -123,7 +135,6 @@ if "user_data" not in st.session_state:
 if "daily_logs" not in st.session_state:
     st.session_state["daily_logs"] = {}
 
-# Kombinierte Favoritenliste (Zutaten & Mahlzeiten zusammen)
 if "favorites_all" not in st.session_state:
     st.session_state["favorites_all"] = [
         {"typ": "Zutat", "name": "Magerquark", "kcal": 67, "protein": 12.0, "carbs": 4.0, "fat": 0.2, "std_g": 100},
@@ -133,6 +144,16 @@ if "favorites_all" not in st.session_state:
 
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
+
+# GEMINI KI-CLIENT INITIALISIEREN
+@st.cache_resource
+def get_gemini_client():
+    api_key = st.secrets.get("GEMINI_API_KEY")
+    if api_key:
+        return genai.Client(api_key=api_key)
+    return None
+
+gemini_client = get_gemini_client()
 
 # ==========================================
 # 4. HELFER- & BERECHNUNGSFUNKTIONEN
@@ -168,7 +189,6 @@ def calculate_user_needs(data):
     target_wasser = (gewicht * 35) + extra_wasser
     return int(target_kcal), int(target_wasser), int(bmr)
 
-# Dynamische Abfragen
 user = st.session_state["current_user"]
 user_goals = st.session_state["user_data"][user]
 calc_kcal, calc_wasser, calc_bmr = calculate_user_needs(user_goals)
@@ -181,27 +201,32 @@ if today_key not in st.session_state["daily_logs"]:
 
 today_log = st.session_state["daily_logs"][today_key]
 
-def parse_recipe_line(line):
-    line = line.strip().lower()
-    if not line: return None, None
-    line = re.sub(r"\beine halbe\b|\bein halbes\b|\bhalb\b", "0.5", line)
-    line = re.sub(r"\bein\b|\beine\b|\beinen\b", "1", line)
-    
-    gramm, zutat_name = 100, line
-    m_g = re.search(r"^(\d+[\.,]?\d*)\s*g\b\s*(.*)", line)
-    if m_g:
-        gramm = float(m_g.group(1).replace(",", "."))
-        zutat_name = m_g.group(2)
-    else:
-        m_stk = re.search(r"^(\d+[\.,]?\d*)\s*(stk|stück)?\s*(.*)", line)
-        if m_stk:
-            anzahl = float(m_stk.group(1).replace(",", "."))
-            raw = m_stk.group(3)
-            weights = {"banane": 120, "pfirsich": 100, "apfel": 150, "ei": 55}
-            found = next((w for k, w in weights.items() if k in raw), 100)
-            gramm = anzahl * found
-            zutat_name = raw
-    return gramm, zutat_name.strip()
+# KI NÄHRWERTANALYSE MIT GEMINI
+def analyze_food_with_ai(prompt_text):
+    if not gemini_client:
+        return None
+    try:
+        sys_prompt = """
+        Du bist ein präziser Ernährungs-Assistent. Analysiere den eingegebenen Text für ein Lebensmittel oder ein Gericht.
+        Schätze die Gesamtwerte für die angegebene oder eine realistisch vermutete Portionsmenge.
+        Antworte AUSSCHLIESSLICH im folgenden JSON-Format ohne zusätzlichen Text oder Markdown-Blöcke:
+        {
+            "name": "Name des Gerichts/Lebensmittels",
+            "gramm": 250,
+            "kcal": 350,
+            "protein": 12.5,
+            "carbs": 45.0,
+            "fat": 8.0
+        }
+        """
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=f"{sys_prompt}\n\nEingabe: {prompt_text}"
+        )
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_text)
+    except Exception as e:
+        return None
 
 def search_open_food_facts(query_text):
     url = "https://world.openfoodfacts.org/cgi/search.pl"
@@ -227,33 +252,29 @@ def search_open_food_facts(query_text):
 # 5. SIDEBAR / BÜRGERMENÜ NAVIGATION
 # ==========================================
 with st.sidebar:
-    if HAS_LOGO:
-        st.image(LOGO_PATH, width=150)
+    st.title("👤 Nutzer wechseln")
+    new_user = st.selectbox("Aktueller Profil:", ["JeannyBunny", "PhillyBilly"], index=0 if user == "JeannyBunny" else 1)
+    if new_user != user:
+        st.session_state["current_user"] = new_user
+        st.rerun()
+
+    st.write("---")
     st.title("📌 Caloop Menü")
     
-    # Navigation
-    menu_pages = ["Übersicht", "Essen", "Trinken", "Bewegung", "Favoriten", "Feedback", "Profil und Ziele", "Barcodescanner"]
-    choice = st.radio("Gehe zu:", menu_pages, index=menu_pages.index(st.session_state["selected_page"]))
+    # Reduzierte Navigationsliste (Essen, Trinken, Bewegung & Scanner ausgeblendet)
+    menu_pages = ["Übersicht", "Favoriten", "Feedback", "Profil und Ziele"]
+    
+    # Sicherstellen, dass kein Absturz passiert, wenn versteckte Seiten aktiv sind
+    current_idx = menu_pages.index(st.session_state["selected_page"]) if st.session_state["selected_page"] in menu_pages else 0
+    choice = st.radio("Gehe zu:", menu_pages, index=current_idx)
     st.session_state["selected_page"] = choice
 
-# Page Directing Guard
 selected_page = st.session_state["selected_page"]
 
 # ==========================================
-# REITER: ÜBERSICHT (DAS DASHBOARD MIT PLOTLY)
+# REITER: ÜBERSICHT (DAS DASHBOARD)
 # ==========================================
 if selected_page == "Übersicht":
-    # Profilumschalter Top Bar
-    c_prof1, c_prof2 = st.columns([2, 1])
-    with c_prof1:
-        if HAS_LOGO: st.image(LOGO_PATH, width=120)
-        else: st.title("Caloop")
-    with c_prof2:
-        new_user = st.selectbox("Nutzer:", ["JeannyBunny", "PhillyBilly"], index=0 if user == "JeannyBunny" else 1)
-        if new_user != user:
-            st.session_state["current_user"] = new_user
-            st.rerun()
-
     st.markdown(f"<p style='text-align: center; color: gray;'>{date.today().strftime('%A, %d. %B %Y')}</p>", unsafe_allow_html=True)
 
     # Berechnungen für Ring & Pegel
@@ -266,11 +287,9 @@ if selected_page == "Übersicht":
     goal_water = user_goals["final_wasser"]
     water_ratio = min(1.0, water_ml / max(1, goal_water))
 
-    # Plottly Donut Ring mit Wasser-Füllungs-Simulation
-    # Zonen: Mangel (Gelb/Orange #E0A96D), Optimum (Grün #2EC4B6), Überschuss (Dunkelrot/Teal #0E5E6F)
+    # Plotly Donut Ring
     fig = go.Figure()
 
-    # Donut Arc für Kalorien
     fig.add_trace(go.Pie(
         values=[min(net_kcal, goal_kcal), max(0, goal_kcal - net_kcal)],
         hole=0.68,
@@ -281,7 +300,7 @@ if selected_page == "Übersicht":
         sort=False
     ))
 
-    # Shapes für den Wasserstand im Inneren des Donut-Kreises
+    # Der innere Wasser-Kreis passt sich exakt an die Donut-Lochgröße (hole=0.68) an
     fig.update_layout(
         showlegend=False,
         margin=dict(t=10, b=10, l=10, r=10),
@@ -293,12 +312,11 @@ if selected_page == "Übersicht":
             )
         ],
         shapes=[
-            # Kreis-Hintergrund Innen (Wasserfüllung)
             dict(
                 type="circle",
                 xref="paper", yref="paper",
-                x0=0.22, y0=0.22, x1=0.78, y1=0.78,
-                fillcolor=f"rgba(30, 136, 229, {round(water_ratio * 0.8, 2)})",
+                x0=0.16, y0=0.16, x1=0.84, y1=0.84, # Präzise an Lochgröße 0.68 angepasst
+                fillcolor=f"rgba(30, 136, 229, {round(water_ratio * 0.75, 2)})",
                 line=dict(color="#1E88E5", width=1),
                 layer="below"
             )
@@ -307,29 +325,41 @@ if selected_page == "Übersicht":
     
     st.plotly_chart(fig, use_container_width=True)
 
-    # 3 Haupt-Navigation Buttons laut Skizze
-    st.markdown('<div class="nav-btn-essen">', unsafe_allow_html=True)
-    if st.button("🍽️ Essen"):
-        st.session_state["selected_page"] = "Essen"
-        st.rerun()
-    st.markdown('</div><br>', unsafe_allow_html=True)
+    # RUNDE ICON-BUTTONS NEBENEINANDER (Essen, Trinken, Bewegung)
+    c_btn1, c_btn2, c_btn3 = st.columns(3)
+    
+    with c_btn1:
+        st.markdown('<div class="round-icon-btn">', unsafe_allow_html=True)
+        if st.button("🍽️", key="nav_essen"):
+            st.session_state["selected_page"] = "Essen"
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; font-weight: bold;'>Essen</p>", unsafe_allow_html=True)
 
-    st.markdown('<div class="nav-btn-trinken">', unsafe_allow_html=True)
-    if st.button("💧 Trinken"):
-        st.session_state["selected_page"] = "Trinken"
-        st.rerun()
-    st.markdown('</div><br>', unsafe_allow_html=True)
+    with c_btn2:
+        st.markdown('<div class="round-icon-btn">', unsafe_allow_html=True)
+        if st.button("💧", key="nav_trinken"):
+            st.session_state["selected_page"] = "Trinken"
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; font-weight: bold;'>Trinken</p>", unsafe_allow_html=True)
 
-    st.markdown('<div class="nav-btn-bewegung">', unsafe_allow_html=True)
-    if st.button("🏃 Bewegung"):
-        st.session_state["selected_page"] = "Bewegung"
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+    with c_btn3:
+        st.markdown('<div class="round-icon-btn">', unsafe_allow_html=True)
+        if st.button("🏃", key="nav_bewegung"):
+            st.session_state["selected_page"] = "Bewegung"
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; font-weight: bold;'>Bewegung</p>", unsafe_allow_html=True)
 
 # ==========================================
 # REITER: ESSEN
 # ==========================================
 elif selected_page == "Essen":
+    if st.button("⬅️ Zurück zur Übersicht"):
+        st.session_state["selected_page"] = "Übersicht"
+        st.rerun()
+
     st.title("🍽️ Essen erfassen")
 
     if st.button("📷 Barcode scannen (Scanner öffnen)"):
@@ -341,29 +371,35 @@ elif selected_page == "Essen":
     target_dest = st.radio("Speichern in:", ["Tagestracker", "Favoriten"], horizontal=True)
     kat = st.selectbox("Mahlzeit", ["Frühstück", "Mittagessen", "Abendessen", "Snack"])
 
-    tab1, tab2 = st.tabs(["📝 Text-Eingabe (Auto)", "✏️ Manuell"])
+    tab1, tab2 = st.tabs(["🤖 KI-Texteingabe", "✏️ Manuell"])
 
     with tab1:
-        txt = st.text_input("Zutat / Menge", placeholder="z.B. 150g Magerquark oder 1 Banane")
-        if st.button("🔍 Suchen & Speichern"):
+        txt = st.text_input("Zutat / Gericht beschreiben", placeholder="z. B. 150g Magerquark oder 2 Scheiben Vollkornbrot mit Butter")
+        if st.button("✨ Mit KI schätzen & Speichern"):
             if txt:
-                gramm, query_name = parse_recipe_line(txt)
-                fav_match = next((item for item in st.session_state["favorites_all"] if item["name"].lower() == query_name.lower()), None)
+                with st.spinner("Gemini analysiert deine Eingabe..."):
+                    ai_result = analyze_food_with_ai(txt)
                 
-                prod = fav_match if fav_match else search_open_food_facts(query_name)
-                if prod:
-                    factor = gramm / 100.0 if "std_g" not in prod else gramm / float(prod["std_g"])
-                    calc_k = int(prod["kcal"] * factor)
-                    calc_p = round(prod.get("protein", 0) * factor, 1)
+                if ai_result:
+                    p_name = ai_result.get("name", txt)
+                    p_gramm = ai_result.get("gramm", 100)
+                    p_kcal = ai_result.get("kcal", 0)
+                    p_prot = ai_result.get("protein", 0.0)
 
                     if target_dest == "Tagestracker":
-                        today_log["eaten"].append({"name": f"[{kat}] {prod['name']} ({int(gramm)}g)", "kcal": calc_k, "protein": calc_p})
-                        st.success(f"✅ {prod['name']} ({calc_k} kcal) hinzugefügt!")
+                        today_log["eaten"].append({"name": f"[{kat}] {p_name} ({p_gramm}g)", "kcal": p_kcal, "protein": p_prot})
+                        st.success(f"✅ KI-Ergebnis: **{p_name}** (~{p_kcal} kcal, {p_prot}g Protein) hinzugefügt!")
                     else:
-                        st.session_state["favorites_all"].append({"typ": "Zutat", "name": prod["name"], "kcal": prod["kcal"], "protein": prod.get("protein", 0), "std_g": 100})
-                        st.success(f"⭐ Zu Favoriten hinzugefügt!")
+                        st.session_state["favorites_all"].append({"typ": "Mahlzeit", "name": p_name, "kcal": p_kcal, "protein": p_prot, "std_g": p_gramm})
+                        st.success(f"⭐ **{p_name}** zu Favoriten hinzugefügt!")
                 else:
-                    st.error("Nährwerte nicht gefunden. Bitte manuell eingeben.")
+                    st.warning("KI nicht erreichbar. Nutze Suche in OpenFoodFacts...")
+                    prod = search_open_food_facts(txt)
+                    if prod:
+                        today_log["eaten"].append({"name": f"[{kat}] {prod['name']} (100g)", "kcal": prod['kcal'], "protein": prod['protein']})
+                        st.success(f"✅ {prod['name']} ({prod['kcal']} kcal) hinzugefügt!")
+                    else:
+                        st.error("Nährwerte konnten nicht ermittelt werden. Bitte manuell eingeben.")
 
     with tab2:
         m_name = st.text_input("Name", placeholder="Selbstgemachter Riegel")
@@ -396,6 +432,10 @@ elif selected_page == "Essen":
 # REITER: TRINKEN
 # ==========================================
 elif selected_page == "Trinken":
+    if st.button("⬅️ Zurück zur Übersicht"):
+        st.session_state["selected_page"] = "Übersicht"
+        st.rerun()
+
     st.title("💧 Wasseraufnahme")
 
     st.metric("Bereits getrunken", f"{today_log['wasser_ml']} / {user_goals['final_wasser']} ml")
@@ -418,6 +458,10 @@ elif selected_page == "Trinken":
 # REITER: BEWEGUNG
 # ==========================================
 elif selected_page == "Bewegung":
+    if st.button("⬅️ Zurück zur Übersicht"):
+        st.session_state["selected_page"] = "Übersicht"
+        st.rerun()
+
     st.title("🏃 Bewegung & Kalorienverbrauch")
 
     st.metric("Verbrannt durch Sport", f"{today_log['bewegung_kcal']} kcal")
@@ -428,7 +472,6 @@ elif selected_page == "Bewegung":
         act = st.selectbox("Aktivität", ["Spazierengehen (moderat)", "Joggen (8-10 km/h)", "Radfahren", "Krafttraining / Fitness", "Schwimmen"])
         duration = st.number_input("Dauer (in Minuten)", min_value=5, value=30, step=5)
         
-        # Schätzung basierend auf Gewicht des Nutzers MET-Werte
         met_table = {"Spazierengehen (moderat)": 3.5, "Joggen (8-10 km/h)": 8.0, "Radfahren": 6.0, "Krafttraining / Fitness": 5.0, "Schwimmen": 7.0}
         weight = user_goals["gewicht"]
         calc_burn = int((met_table[act] * 3.5 * weight / 200) * duration)
@@ -468,14 +511,12 @@ elif selected_page == "Feedback":
     st.title("🤖 Caloop Feedback Coach")
     st.write("Frag mich alles zu deiner heutigen Bilanz, Nährstoffen oder Tipps!")
 
-    # Berechne Kontext-Daten
     tot_k = sum(i["kcal"] for i in today_log["eaten"])
     tot_p = sum(i.get("protein", 0) for i in today_log["eaten"])
     tot_w = today_log["wasser_ml"]
     net_k = tot_k - today_log["bewegung_kcal"]
     diff_k = user_goals["final_kcal"] - net_k
 
-    # Initialer Begrüßungs-Kontext vom Bot
     if not st.session_state["chat_history"]:
         intro = f"Hallo {user}! 👋 Hier ist dein Feedback-Status:\n\n"
         intro += f"- **Kalorien-Netto:** {net_k} / {user_goals['final_kcal']} kcal\n"
@@ -491,18 +532,15 @@ elif selected_page == "Feedback":
 
         st.session_state["chat_history"].append({"role": "assistant", "content": intro})
 
-    # Chat-Historie anzeigen
     for msg in st.session_state["chat_history"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Benutzereingabe
     if user_prompt := st.chat_input("Stelle eine Frage an deinen Coach..."):
         st.session_state["chat_history"].append({"role": "user", "content": user_prompt})
         with st.chat_message("user"):
             st.markdown(user_prompt)
 
-        # Smart Bot Logik (Kontext-basiert)
         prompt_low = user_prompt.lower()
         if "essen" in prompt_low or "rezept" in prompt_low or "hunger" in prompt_low:
             if tot_p < (user_goals['gewicht'] * 1.5):
@@ -550,12 +588,15 @@ elif selected_page == "Profil und Ziele":
         st.success("Profil erfolgreich gespeichert!")
 
 # ==========================================
-# REITER: BARCODESCANNER (SEPARATE SEITE)
+# REITER: BARCODESCANNER
 # ==========================================
 elif selected_page == "Barcodescanner":
+    if st.button("⬅️ Zurück zum Essen"):
+        st.session_state["selected_page"] = "Essen"
+        st.rerun()
+
     st.title("📷 Barcode Scanner")
 
-    # Scanner Component
     import streamlit.components.v1 as components
     scanner_html = """
     <!DOCTYPE html>
